@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional
 import uuid
 
@@ -24,38 +24,171 @@ router = APIRouter()
 
 
 class TransferRequest(BaseModel):
-    """Request model for transfer."""
-    from_account_id: int = Field(..., description="Source account ID")
-    to_account_id: int = Field(..., description="Destination account ID")
-    amount: str = Field(..., description="Amount as decimal string")
-    currency: str = Field(..., min_length=3, max_length=3, description="ISO 4217 currency code")
-    idempotency_key: Optional[str] = Field(None, description="Idempotency key (auto-generated if not provided)")
-    description: Optional[str] = Field(None, description="Transaction description")
-    reference_id: Optional[str] = Field(None, description="External reference ID")
+    """Request model for money transfer between accounts."""
+    from_account_id: int = Field(
+        ..., 
+        description="Source account ID to debit",
+        examples=[1001]
+    )
+    to_account_id: int = Field(
+        ..., 
+        description="Destination account ID to credit",
+        examples=[1002]
+    )
+    amount: str = Field(
+        ..., 
+        description="Amount as decimal string (no floats allowed)",
+        examples=["100.50"]
+    )
+    currency: str = Field(
+        ..., 
+        min_length=3, 
+        max_length=3, 
+        description="ISO 4217 currency code",
+        examples=["USD"]
+    )
+    idempotency_key: Optional[str] = Field(
+        None, 
+        description="Unique key for idempotent requests. If same key is reused, cached response is returned.",
+        examples=["txn-abc123-unique-key"]
+    )
+    description: Optional[str] = Field(
+        None, 
+        description="Human-readable transaction description",
+        examples=["Payment for invoice #12345"]
+    )
+    reference_id: Optional[str] = Field(
+        None, 
+        description="External reference ID for reconciliation",
+        examples=["INV-2024-001"]
+    )
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "from_account_id": 1001,
+                "to_account_id": 1002,
+                "amount": "250.00",
+                "currency": "USD",
+                "idempotency_key": "unique-transfer-key-123",
+                "description": "Monthly rent payment",
+                "reference_id": "RENT-JAN-2024"
+            }
+        }
+    )
 
 
 class TransferResponse(BaseModel):
-    """Response model for transfer."""
-    transaction_id: int
-    from_account_id: int
-    to_account_id: int
-    amount: str
-    currency: str
-    status: str
-    created_at: str
+    """Response model for completed transfer."""
+    transaction_id: int = Field(..., description="Unique transaction identifier")
+    from_account_id: int = Field(..., description="Source account ID")
+    to_account_id: int = Field(..., description="Destination account ID")
+    amount: str = Field(..., description="Transfer amount")
+    currency: str = Field(..., description="Currency code")
+    status: str = Field(..., description="Transaction status (PENDING, COMPLETED, FAILED)")
+    created_at: str = Field(..., description="ISO 8601 timestamp of creation")
     
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "example": {
+                "transaction_id": 5001,
+                "from_account_id": 1001,
+                "to_account_id": 1002,
+                "amount": "250.00",
+                "currency": "USD",
+                "status": "COMPLETED",
+                "created_at": "2024-01-15T10:30:00Z"
+            }
+        }
+    )
 
 
-@router.post("", response_model=TransferResponse, status_code=status.HTTP_201_CREATED)
+class ErrorResponse(BaseModel):
+    """Standard error response model."""
+    detail: str = Field(..., description="Error description")
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "detail": "Insufficient funds in account 1001"
+            }
+        }
+    )
+
+
+@router.post(
+    "", 
+    response_model=TransferResponse, 
+    status_code=status.HTTP_201_CREATED,
+    summary="Transfer Money",
+    description="""
+Transfer money between two accounts atomically.
+
+## Features
+- **ACID compliant** - All operations are atomic
+- **Idempotent** - Safe to retry with same idempotency_key
+- **Double-entry** - Creates balanced debit/credit entries
+
+## Validation
+- Source account must have sufficient balance
+- Both accounts must exist and be active
+- Currency must match for both accounts
+- Amount must be positive
+
+## Error Codes
+- `400` - Invalid request (insufficient funds, invalid amount)
+- `404` - Account not found
+- `409` - Duplicate transaction (idempotency key reused with different data)
+    """,
+    responses={
+        201: {
+            "description": "Transfer completed successfully",
+            "model": TransferResponse
+        },
+        400: {
+            "description": "Bad request - insufficient funds or invalid data",
+            "model": ErrorResponse,
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "insufficient_funds": {
+                            "summary": "Insufficient Funds",
+                            "value": {"detail": "Insufficient funds in account 1001. Available: 50.00, Required: 250.00"}
+                        },
+                        "invalid_amount": {
+                            "summary": "Invalid Amount",
+                            "value": {"detail": "Amount must be positive"}
+                        }
+                    }
+                }
+            }
+        },
+        404: {
+            "description": "Account not found",
+            "model": ErrorResponse
+        },
+        409: {
+            "description": "Duplicate transaction",
+            "model": ErrorResponse
+        }
+    }
+)
 async def transfer_money(
     request: TransferRequest,
     http_request: Request,
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id)
 ):
-    """Transfer money between accounts."""
+    """
+    Transfer money between two accounts.
+    
+    This endpoint performs an atomic transfer ensuring:
+    - The source account is debited
+    - The destination account is credited
+    - Both operations succeed or both fail (ACID)
+    - Audit trail is created
+    """
     # Generate idempotency key if not provided
     idempotency_key = request.idempotency_key or str(uuid.uuid4())
     
